@@ -1,0 +1,2094 @@
+-- LocalScript in StarterGui or StarterPlayerScripts
+
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local Workspace = game:GetService("Workspace")
+local Lighting = game:GetService("Lighting")
+
+local player = Players.LocalPlayer
+local playerGui = player:WaitForChild("PlayerGui")
+local camera = Workspace.CurrentCamera
+
+local character, humanoid, hrp
+
+local aimbotEnabled = false
+local aimbotTarget = "Body (HRP)"
+local aimbotSmoothness = 18
+local aimbotPrediction = 0.08
+local aimbotFovPixels = 220
+local aimbotMaxDistance = 250
+local aimbotVisibleCheck = true
+
+local killAuraEnabled = false
+
+local espEnabled = false
+local espMode = "Highlight"
+local espHpCheck = true
+local espColor = Color3.fromRGB(255, 50, 50)
+local espFriendColor = Color3.fromRGB(0, 255, 0)
+local esp3DLineThickness = 0.012
+local espHighlightFillTransparency = 0.75
+local espHighlightOutlineTransparency = 0
+local nametags = false
+local espObjects = {}
+local nametagObjects = {}
+
+local friendsList = {}
+local activeBinds = {}
+
+-- Movement
+local nofallEnabled = false
+local nofallConn = nil
+local glideFallSpeed = 14
+
+local speedEnabled = false
+local speedMode = "Strafe"
+local speedValue = 1
+local speedConn = nil
+
+local swimEnabled = false
+local swimSpeed = 16
+local swimConn = nil
+local originalSwimGravity = nil
+local originalSwimWalkSpeed = nil
+
+-- Misc
+local loopfbEnabled = false
+local loopfbConn = nil
+local nofogEnabled = false
+local antiSlowEnabled = false
+local antiRagdollEnabled = false
+local assistHitEnabled = false
+local assistHitTeamCheck = true
+local assistHitMaxDistance = 18
+local assistHitMaxFovPixels = 180
+local assistHitLockTime = 1.2
+local assistHitLockDistance = 12
+local assistHitStatus = "Idle"
+local assistHitTargetName = "none"
+local assistHitInputConn = nil
+local assistHitFeedbackConn = nil
+local assistHitFeedbackSource = nil
+local assistHitUiConn = nil
+local assistHitLockedTarget = nil
+local assistHitLockExpiresAt = 0
+local assistHitLastRequestedTarget = nil
+local originalFogStart = nil
+local originalFogEnd = nil
+local originalAmbient = nil
+local originalOutdoorAmbient = nil
+local originalBrightness = nil
+local originalClockTime = nil
+local originalGlobalShadows = nil
+
+local refreshNametags
+local assistHitTargetLabel
+local assistHitStateLabel
+local startSwim
+
+local function disconnectAssistHitFeedback()
+    if assistHitFeedbackConn then
+        assistHitFeedbackConn:Disconnect()
+        assistHitFeedbackConn = nil
+    end
+
+    assistHitFeedbackSource = nil
+end
+
+local function getAssistHitRemotes()
+    local remotesFolder = ReplicatedStorage:FindFirstChild("GameRemotes")
+    if not remotesFolder then
+        disconnectAssistHitFeedback()
+        return nil, nil
+    end
+
+    local tryAttackRemote = remotesFolder:FindFirstChild("TryAttackTarget")
+    local feedbackRemote = remotesFolder:FindFirstChild("AssistHitFeedback")
+
+    if feedbackRemote ~= assistHitFeedbackSource then
+        disconnectAssistHitFeedback()
+
+        if feedbackRemote then
+            assistHitFeedbackSource = feedbackRemote
+            assistHitFeedbackConn = feedbackRemote.OnClientEvent:Connect(function(ok, message)
+                if ok then
+                    assistHitStatus = "Hit: " .. tostring(message)
+                    if assistHitLastRequestedTarget and assistHitLastRequestedTarget.Parent == Players then
+                        assistHitLockedTarget = assistHitLastRequestedTarget
+                        assistHitLockExpiresAt = os.clock() + assistHitLockTime
+                    end
+                else
+                    assistHitStatus = "Blocked: " .. tostring(message)
+                end
+            end)
+        end
+    end
+
+    return tryAttackRemote, feedbackRemote
+end
+
+local function makeDraggable(frame)
+    local dragging, dragStart, startPos
+
+    frame.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1
+            or input.UserInputType == Enum.UserInputType.Touch then
+            dragging = true
+            dragStart = input.Position
+            startPos = frame.Position
+
+            input.Changed:Connect(function()
+                if input.UserInputState == Enum.UserInputState.End then
+                    dragging = false
+                end
+            end)
+        end
+    end)
+
+    UserInputService.InputChanged:Connect(function(input)
+        if dragging and (
+            input.UserInputType == Enum.UserInputType.MouseMovement
+            or input.UserInputType == Enum.UserInputType.Touch
+        ) then
+            local delta = input.Position - dragStart
+            frame.Position = UDim2.new(
+                startPos.X.Scale,
+                startPos.X.Offset + delta.X,
+                startPos.Y.Scale,
+                startPos.Y.Offset + delta.Y
+            )
+        end
+    end)
+end
+
+local function getRoot(char)
+    return char and char:FindFirstChild("HumanoidRootPart")
+end
+
+local function updateCharacter()
+    character = player.Character or player.CharacterAdded:Wait()
+    humanoid = character:WaitForChild("Humanoid")
+    hrp = character:WaitForChild("HumanoidRootPart")
+
+    character:SetAttribute("AntiSlowUI", antiSlowEnabled)
+    character:SetAttribute("AntiRagdollUI", antiRagdollEnabled)
+end
+
+updateCharacter()
+
+player.CharacterAdded:Connect(function()
+    task.wait(0.5)
+    updateCharacter()
+
+    if swimEnabled then
+        startSwim()
+    end
+
+    assistHitLockedTarget = nil
+    assistHitLastRequestedTarget = nil
+    assistHitStatus = assistHitEnabled and "Ready" or "Idle"
+end)
+
+local function isPlayerAlive(p)
+    if not espHpCheck then
+        return true
+    end
+
+    if not p.Character then
+        return false
+    end
+
+    local hum = p.Character:FindFirstChildOfClass("Humanoid")
+    if not hum then
+        return false
+    end
+
+    return hum.Health > 0.1
+end
+
+local function isCombatTargetAlive(p)
+    if not p.Character then
+        return false
+    end
+
+    local hum = p.Character:FindFirstChildOfClass("Humanoid")
+    local root = p.Character:FindFirstChild("HumanoidRootPart")
+    if not hum or not root then
+        return false
+    end
+
+    return hum.Health > 0
+end
+
+local function isSameTeam(a, b)
+    if not assistHitTeamCheck then
+        return false
+    end
+
+    if a.Neutral or b.Neutral then
+        return false
+    end
+
+    return a.Team ~= nil and a.Team == b.Team
+end
+
+local function hasAssistHitLineOfSight(targetCharacter)
+    if not character or not targetCharacter then
+        return false
+    end
+
+    local targetRoot = targetCharacter:FindFirstChild("HumanoidRootPart")
+    if not targetRoot then
+        return false
+    end
+
+    local params = RaycastParams.new()
+    params.FilterType = Enum.RaycastFilterType.Exclude
+    params.FilterDescendantsInstances = { character, targetCharacter }
+
+    local origin = camera.CFrame.Position
+    local direction = targetRoot.Position - origin
+    local result = Workspace:Raycast(origin, direction, params)
+    return result == nil
+end
+
+local function getLockedAssistTarget()
+    if not assistHitLockedTarget then
+        return nil
+    end
+
+    if os.clock() > assistHitLockExpiresAt then
+        assistHitLockedTarget = nil
+        return nil
+    end
+
+    if not hrp or not isCombatTargetAlive(assistHitLockedTarget) then
+        assistHitLockedTarget = nil
+        return nil
+    end
+
+    if friendsList[assistHitLockedTarget.Name] or isSameTeam(player, assistHitLockedTarget) then
+        assistHitLockedTarget = nil
+        return nil
+    end
+
+    local targetCharacter = assistHitLockedTarget.Character
+    local targetRoot = targetCharacter and targetCharacter:FindFirstChild("HumanoidRootPart")
+    if not targetRoot then
+        assistHitLockedTarget = nil
+        return nil
+    end
+
+    local worldDistance = (targetRoot.Position - hrp.Position).Magnitude
+    if worldDistance > assistHitLockDistance then
+        assistHitLockedTarget = nil
+        return nil
+    end
+
+    if not hasAssistHitLineOfSight(targetCharacter) then
+        assistHitLockedTarget = nil
+        return nil
+    end
+
+    return assistHitLockedTarget
+end
+
+local function getClosestAssistHitTarget()
+    if not hrp then
+        return nil
+    end
+
+    local lockedTarget = getLockedAssistTarget()
+    if lockedTarget then
+        return lockedTarget
+    end
+
+    local viewportCenter = camera.ViewportSize / 2
+    local bestTarget = nil
+    local bestScreenDistance = assistHitMaxFovPixels
+
+    for _, otherPlayer in ipairs(Players:GetPlayers()) do
+        if otherPlayer ~= player
+            and not friendsList[otherPlayer.Name]
+            and isCombatTargetAlive(otherPlayer)
+            and not isSameTeam(player, otherPlayer) then
+            local targetCharacter = otherPlayer.Character
+            local targetRoot = targetCharacter and targetCharacter:FindFirstChild("HumanoidRootPart")
+
+            if targetRoot then
+                local worldDistance = (targetRoot.Position - hrp.Position).Magnitude
+                if worldDistance <= assistHitMaxDistance and hasAssistHitLineOfSight(targetCharacter) then
+                    local screenPoint, onScreen = camera:WorldToViewportPoint(targetRoot.Position)
+                    if onScreen and screenPoint.Z > 0 then
+                        local screenDistance = (Vector2.new(screenPoint.X, screenPoint.Y) - viewportCenter).Magnitude
+                        if screenDistance < bestScreenDistance then
+                            bestScreenDistance = screenDistance
+                            bestTarget = otherPlayer
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    return bestTarget
+end
+
+local function stopAssistHit()
+    if assistHitInputConn then
+        assistHitInputConn:Disconnect()
+        assistHitInputConn = nil
+    end
+
+    assistHitLastRequestedTarget = nil
+    assistHitLockedTarget = nil
+    assistHitLockExpiresAt = 0
+end
+
+local function startAssistHit()
+    stopAssistHit()
+
+    if not assistHitEnabled then
+        return
+    end
+
+    getAssistHitRemotes()
+
+    assistHitInputConn = UserInputService.InputBegan:Connect(function(input, gameProcessed)
+        if gameProcessed or not assistHitEnabled then
+            return
+        end
+
+        if input.UserInputType ~= Enum.UserInputType.MouseButton1 then
+            return
+        end
+
+        local tryAttackRemote = getAssistHitRemotes()
+        if not tryAttackRemote then
+            assistHitStatus = "Missing GameRemotes"
+            return
+        end
+
+        local target = getClosestAssistHitTarget()
+        if not target then
+            assistHitStatus = "No target"
+            return
+        end
+
+        assistHitLastRequestedTarget = target
+        assistHitStatus = "Request: " .. target.Name
+        tryAttackRemote:FireServer(target)
+    end)
+end
+
+local function createKeybindsList()
+    local kg = Instance.new("ScreenGui")
+    kg.Name = "KeybindsList"
+    kg.ResetOnSpawn = false
+    kg.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+    kg.Parent = playerGui
+
+    local frame = Instance.new("Frame")
+    frame.Name = "MainFrame"
+    frame.Size = UDim2.new(0, 200, 0, 25)
+    frame.Position = UDim2.new(0, 10, 0.5, -100)
+    frame.BackgroundColor3 = Color3.fromRGB(20, 20, 20)
+    frame.BorderSizePixel = 0
+    frame.Active = true
+    frame.Parent = kg
+    Instance.new("UICorner", frame).CornerRadius = UDim.new(0, 6)
+
+    local title = Instance.new("TextLabel")
+    title.Name = "Title"
+    title.Size = UDim2.new(1, 0, 0, 25)
+    title.BackgroundTransparency = 1
+    title.Text = "keybinds"
+    title.TextColor3 = Color3.fromRGB(255, 255, 255)
+    title.TextSize = 14
+    title.Font = Enum.Font.GothamBold
+    title.Parent = frame
+
+    local ll = Instance.new("UIListLayout")
+    ll.SortOrder = Enum.SortOrder.LayoutOrder
+    ll.Padding = UDim.new(0, 2)
+    ll.Parent = frame
+
+    makeDraggable(frame)
+    return kg
+end
+
+local keybindsListGui = createKeybindsList()
+
+local function updateKeybindsList()
+    local frame = keybindsListGui.MainFrame
+
+    for _, child in ipairs(frame:GetChildren()) do
+        if child:IsA("TextLabel") and child.Name ~= "Title" then
+            child:Destroy()
+        end
+    end
+
+    local count = 0
+    for bindName, bindData in pairs(activeBinds) do
+        if bindData.active then
+            count += 1
+
+            local label = Instance.new("TextLabel")
+            label.Size = UDim2.new(1, -10, 0, 20)
+            label.BackgroundTransparency = 1
+            label.Text = string.format("%s [%s]", bindName, bindData.key)
+            label.TextColor3 = Color3.fromRGB(60, 150, 255)
+            label.TextSize = 12
+            label.Font = Enum.Font.Gotham
+            label.TextXAlignment = Enum.TextXAlignment.Left
+            label.Parent = frame
+        end
+    end
+
+    frame.Size = UDim2.new(0, 200, 0, 25 + (count * 22))
+end
+
+local infoGui = Instance.new("ScreenGui")
+infoGui.Name = "InfoPanel"
+infoGui.ResetOnSpawn = false
+infoGui.Parent = playerGui
+
+local infoFrame = Instance.new("Frame")
+infoFrame.Size = UDim2.new(0, 300, 0, 30)
+infoFrame.Position = UDim2.new(0.5, -150, 1, -50)
+infoFrame.BackgroundColor3 = Color3.fromRGB(20, 20, 20)
+infoFrame.BorderSizePixel = 0
+infoFrame.Active = true
+infoFrame.Parent = infoGui
+Instance.new("UICorner", infoFrame).CornerRadius = UDim.new(0, 8)
+makeDraggable(infoFrame)
+
+local creditsLabel = Instance.new("TextLabel")
+creditsLabel.Size = UDim2.new(1, 0, 1, 0)
+creditsLabel.BackgroundTransparency = 1
+creditsLabel.Text = "made by vladikbypasser, seatny"
+creditsLabel.TextColor3 = Color3.fromRGB(150, 150, 150)
+creditsLabel.TextSize = 12
+creditsLabel.Font = Enum.Font.Gotham
+creditsLabel.Parent = infoFrame
+
+local targetHudGui = Instance.new("ScreenGui")
+targetHudGui.Name = "TargetHud"
+targetHudGui.ResetOnSpawn = false
+targetHudGui.Parent = playerGui
+
+local targetHudFrame = Instance.new("Frame")
+targetHudFrame.Name = "HudFrame"
+targetHudFrame.Size = UDim2.new(0, 260, 0, 85)
+targetHudFrame.Position = UDim2.new(1, -275, 0, 10)
+targetHudFrame.BackgroundColor3 = Color3.fromRGB(15, 15, 15)
+targetHudFrame.BorderSizePixel = 0
+targetHudFrame.Visible = false
+targetHudFrame.Active = true
+targetHudFrame.Parent = targetHudGui
+Instance.new("UICorner", targetHudFrame).CornerRadius = UDim.new(0, 8)
+makeDraggable(targetHudFrame)
+
+local targetAvatar = Instance.new("ImageLabel")
+targetAvatar.Size = UDim2.new(0, 64, 0, 64)
+targetAvatar.Position = UDim2.new(0, 10, 0, 10)
+targetAvatar.BackgroundColor3 = Color3.fromRGB(30, 30, 30)
+targetAvatar.BorderSizePixel = 0
+targetAvatar.Image = ""
+targetAvatar.Parent = targetHudFrame
+Instance.new("UICorner", targetAvatar).CornerRadius = UDim.new(0, 6)
+
+local targetNameLabel = Instance.new("TextLabel")
+targetNameLabel.Size = UDim2.new(1, -85, 0, 24)
+targetNameLabel.Position = UDim2.new(0, 82, 0, 8)
+targetNameLabel.BackgroundTransparency = 1
+targetNameLabel.Text = "Target"
+targetNameLabel.TextColor3 = Color3.fromRGB(255, 255, 255)
+targetNameLabel.TextSize = 15
+targetNameLabel.Font = Enum.Font.GothamBold
+targetNameLabel.TextXAlignment = Enum.TextXAlignment.Left
+targetNameLabel.Parent = targetHudFrame
+
+local targetHPLabel = Instance.new("TextLabel")
+targetHPLabel.Size = UDim2.new(1, -85, 0, 18)
+targetHPLabel.Position = UDim2.new(0, 82, 0, 34)
+targetHPLabel.BackgroundTransparency = 1
+targetHPLabel.Text = "HP: 100 / 100"
+targetHPLabel.TextColor3 = Color3.fromRGB(100, 220, 100)
+targetHPLabel.TextSize = 12
+targetHPLabel.Font = Enum.Font.Gotham
+targetHPLabel.TextXAlignment = Enum.TextXAlignment.Left
+targetHPLabel.Parent = targetHudFrame
+
+local hpBarBg = Instance.new("Frame")
+hpBarBg.Size = UDim2.new(1, -85, 0, 10)
+hpBarBg.Position = UDim2.new(0, 82, 0, 56)
+hpBarBg.BackgroundColor3 = Color3.fromRGB(50, 50, 50)
+hpBarBg.BorderSizePixel = 0
+hpBarBg.Parent = targetHudFrame
+Instance.new("UICorner", hpBarBg).CornerRadius = UDim.new(0, 5)
+
+local hpBarFill = Instance.new("Frame")
+hpBarFill.Size = UDim2.new(1, 0, 1, 0)
+hpBarFill.BackgroundColor3 = Color3.fromRGB(80, 200, 80)
+hpBarFill.BorderSizePixel = 0
+hpBarFill.Parent = hpBarBg
+Instance.new("UICorner", hpBarFill).CornerRadius = UDim.new(0, 5)
+
+local lastTargetNameCache = ""
+local function updateTargetHud(targetPlayer)
+    if not targetPlayer then
+        targetHudFrame.Visible = false
+        lastTargetNameCache = ""
+        return
+    end
+
+    targetHudFrame.Visible = true
+    targetNameLabel.Text = targetPlayer.Name
+
+    if lastTargetNameCache ~= targetPlayer.Name then
+        lastTargetNameCache = targetPlayer.Name
+        pcall(function()
+            local content = Players:GetUserThumbnailAsync(
+                targetPlayer.UserId,
+                Enum.ThumbnailType.HeadShot,
+                Enum.ThumbnailSize.Size60x60
+            )
+            targetAvatar.Image = content
+        end)
+    end
+
+    if targetPlayer.Character then
+        local hum = targetPlayer.Character:FindFirstChildOfClass("Humanoid")
+        if hum then
+            local hp = math.floor(hum.Health)
+            local maxHp = math.floor(hum.MaxHealth)
+            local pct = math.clamp(hum.Health / math.max(hum.MaxHealth, 1), 0, 1)
+
+            targetHPLabel.Text = string.format("HP: %d / %d", hp, maxHp)
+            hpBarFill.Size = UDim2.new(pct, 0, 1, 0)
+
+            if pct > 0.6 then
+                hpBarFill.BackgroundColor3 = Color3.fromRGB(80, 200, 80)
+                targetHPLabel.TextColor3 = Color3.fromRGB(100, 220, 100)
+            elseif pct > 0.3 then
+                hpBarFill.BackgroundColor3 = Color3.fromRGB(220, 180, 40)
+                targetHPLabel.TextColor3 = Color3.fromRGB(220, 180, 40)
+            else
+                hpBarFill.BackgroundColor3 = Color3.fromRGB(220, 60, 60)
+                targetHPLabel.TextColor3 = Color3.fromRGB(220, 60, 60)
+            end
+        end
+    end
+end
+
+local function safeLoad(url)
+    local ok, result = pcall(function()
+        return loadstring(game:HttpGet(url))()
+    end)
+
+    if not ok then
+        warn("Failed to load: " .. url .. "\n" .. tostring(result))
+        return nil
+    end
+
+    return result
+end
+
+local Library = safeLoad("https://raw.githubusercontent.com/violin-suzutsuki/LinoriaLib/main/Library.lua")
+local ThemeManager = safeLoad("https://raw.githubusercontent.com/violin-suzutsuki/LinoriaLib/main/addons/ThemeManager.lua")
+local SaveManager = safeLoad("https://raw.githubusercontent.com/violin-suzutsuki/LinoriaLib/main/addons/SaveManager.lua")
+
+if not Library then
+    warn("Library failed!")
+    return
+end
+
+local Window = Library:CreateWindow({
+    Title = "4ifur.su",
+    Center = true,
+    AutoShow = true,
+    TabPadding = 8
+})
+
+local Tabs = {
+    Combat = Window:AddTab("Combat"),
+    Visual = Window:AddTab("Visual"),
+    Movement = Window:AddTab("Movement"),
+    Friends = Window:AddTab("Friends"),
+    Misc = Window:AddTab("Misc"),
+    WIP = Window:AddTab("WIP"),
+    Config = Window:AddTab("Config")
+}
+
+local CombatBox = Tabs.Combat:AddLeftGroupbox("Combat")
+local VisualBox = Tabs.Visual:AddLeftGroupbox("Visual")
+local MovementBox = Tabs.Movement:AddLeftGroupbox("Movement")
+local FriendsBox = Tabs.Friends:AddLeftGroupbox("Friends")
+local MiscBox = Tabs.Misc:AddLeftGroupbox("Misc")
+local WIPBox = Tabs.WIP:AddLeftGroupbox("WIP")
+
+local function isVisible(targetPart)
+    if not hrp or not targetPart then
+        return false
+    end
+
+    local ray = Ray.new(hrp.Position, (targetPart.Position - hrp.Position).Unit * 1000)
+    local hit = Workspace:FindPartOnRayWithIgnoreList(ray, { character, targetPart.Parent })
+    return hit == nil or hit == targetPart
+end
+
+local function getClosestPlayer()
+    local closest, closestDist = nil, math.huge
+    local myRoot = getRoot(character)
+
+    if not myRoot then
+        return nil
+    end
+
+    for _, p in ipairs(Players:GetPlayers()) do
+        if p ~= player and p.Character then
+            local theirRoot = getRoot(p.Character)
+            if theirRoot then
+                if friendsList[p.Name] then
+                    continue
+                end
+
+                local dist = (theirRoot.Position - myRoot.Position).Magnitude
+                if dist < closestDist then
+                    closestDist = dist
+                    closest = p
+                end
+            end
+        end
+    end
+
+    return closest
+end
+
+local function getAimbotPart(targetChar)
+    if aimbotTarget == "Head" then
+        return targetChar:FindFirstChild("Head")
+    end
+
+    return targetChar:FindFirstChild("HumanoidRootPart")
+end
+
+local function isAimbotVisible(targetPart)
+    if not aimbotVisibleCheck then
+        return true
+    end
+
+    if not character or not targetPart then
+        return false
+    end
+
+    local params = RaycastParams.new()
+    params.FilterType = Enum.RaycastFilterType.Exclude
+    params.FilterDescendantsInstances = { character, targetPart.Parent }
+
+    local origin = camera.CFrame.Position
+    local direction = targetPart.Position - origin
+    local result = Workspace:Raycast(origin, direction, params)
+    return result == nil
+end
+
+local function getClosestAimbotTarget()
+    if not hrp then
+        return nil, nil
+    end
+
+    local viewportCenter = camera.ViewportSize / 2
+    local bestPlayer = nil
+    local bestPart = nil
+    local bestScreenDistance = aimbotFovPixels
+
+    for _, p in ipairs(Players:GetPlayers()) do
+        if p ~= player and p.Character and not friendsList[p.Name] and isCombatTargetAlive(p) then
+            local part = getAimbotPart(p.Character)
+            local root = getRoot(p.Character)
+
+            if part and root then
+                local worldDistance = (root.Position - hrp.Position).Magnitude
+                if worldDistance <= aimbotMaxDistance and isAimbotVisible(part) then
+                    local screenPoint, onScreen = camera:WorldToViewportPoint(part.Position)
+
+                    if onScreen and screenPoint.Z > 0 then
+                        local screenDistance = (Vector2.new(screenPoint.X, screenPoint.Y) - viewportCenter).Magnitude
+
+                        if screenDistance < bestScreenDistance then
+                            bestScreenDistance = screenDistance
+                            bestPlayer = p
+                            bestPart = part
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    return bestPlayer, bestPart
+end
+
+CombatBox:AddLabel("Kill Aura")
+
+local killAuraAimbotLoop = nil
+local killAuraACLoop = nil
+local killAuraClickRate = 6
+
+local function stopKillAura()
+    killAuraEnabled = false
+
+    if killAuraAimbotLoop then
+        killAuraAimbotLoop:Disconnect()
+        killAuraAimbotLoop = nil
+    end
+
+    if killAuraACLoop then
+        killAuraACLoop:Disconnect()
+        killAuraACLoop = nil
+    end
+
+    updateTargetHud(nil)
+end
+
+local function startKillAura()
+    stopKillAura()
+
+    if not (Toggles.KillAuraEnabled and Toggles.KillAuraEnabled.Value) then
+        return
+    end
+
+    killAuraEnabled = true
+
+    killAuraAimbotLoop = RunService.RenderStepped:Connect(function()
+        if not killAuraEnabled then
+            return
+        end
+
+        local target = getClosestPlayer()
+        updateTargetHud(target)
+
+        if not target or not target.Character then
+            return
+        end
+
+        local part = getAimbotPart(target.Character)
+        if not part then
+            return
+        end
+
+        local dir = (part.Position - camera.CFrame.Position).Unit
+        camera.CFrame = CFrame.new(camera.CFrame.Position, camera.CFrame.Position + dir)
+    end)
+
+    local interval = 1 / killAuraClickRate
+    local kaTimer = 0
+
+    killAuraACLoop = RunService.Heartbeat:Connect(function(delta)
+        if not killAuraEnabled then
+            return
+        end
+
+        kaTimer += delta
+        if kaTimer >= interval then
+            kaTimer = 0
+
+            if mouse1click then
+                mouse1click()
+            elseif mouse1press and mouse1release then
+                mouse1press()
+                task.wait()
+                mouse1release()
+            end
+        end
+    end)
+end
+
+CombatBox:AddToggle("KillAuraEnabled", {
+    Text = "Kill Aura",
+    Default = false,
+    Callback = function(value)
+        activeBinds["KillAura"] = { active = value, key = "Bind" }
+        updateKeybindsList()
+
+        if value then
+            startKillAura()
+        else
+            stopKillAura()
+        end
+    end
+}):AddKeyPicker("KillAuraBind", {
+    Default = "None",
+    Text = "Kill Aura Bind",
+    Mode = "Toggle",
+    Callback = function(value)
+        if value then
+            Toggles.KillAuraEnabled:SetValue(not Toggles.KillAuraEnabled.Value)
+        end
+    end
+})
+
+CombatBox:AddLabel("Aim Method")
+CombatBox:AddDropdown("AimbotMode", {
+    Values = { "Body (HRP)", "Head" },
+    Default = 1,
+    Multi = false,
+    Text = "Aim Target",
+    Callback = function(value)
+        aimbotTarget = value
+    end
+})
+
+CombatBox:AddLabel("Aim Assist v2")
+local aimbotLoop = nil
+
+local function stopAimbot()
+    if aimbotLoop then
+        aimbotLoop:Disconnect()
+        aimbotLoop = nil
+    end
+end
+
+local function startAimbot()
+    stopAimbot()
+
+    if not aimbotEnabled then
+        return
+    end
+
+    aimbotLoop = RunService.RenderStepped:Connect(function(deltaTime)
+        if not aimbotEnabled then
+            return
+        end
+
+        if not UserInputService:IsMouseButtonPressed(Enum.UserInputType.MouseButton2) then
+            return
+        end
+
+        local target, part = getClosestAimbotTarget()
+        if not target or not part then
+            return
+        end
+
+        local predictedPosition = part.Position + (part.AssemblyLinearVelocity * aimbotPrediction)
+        local targetCFrame = CFrame.new(camera.CFrame.Position, predictedPosition)
+        local alpha = math.clamp(1 - math.exp(-aimbotSmoothness * deltaTime), 0, 1)
+
+        camera.CFrame = camera.CFrame:Lerp(targetCFrame, alpha)
+    end)
+end
+
+CombatBox:AddToggle("AimbotEnabled", {
+    Text = "Aim Assist (hold RMB)",
+    Default = false,
+    Callback = function(value)
+        aimbotEnabled = value
+        activeBinds["Aimbot"] = { active = value, key = "RMB" }
+        updateKeybindsList()
+
+        if value then
+            startAimbot()
+        else
+            stopAimbot()
+        end
+    end
+})
+
+CombatBox:AddLabel("Aim Assist Settings")
+CombatBox:AddSlider("AimbotSmoothness", {
+    Text = "Aim Smoothness",
+    Default = 18,
+    Min = 1,
+    Max = 60,
+    Rounding = 0,
+    Callback = function(value)
+        aimbotSmoothness = value
+    end
+})
+
+CombatBox:AddSlider("AimbotPrediction", {
+    Text = "Aim Prediction x100",
+    Default = 8,
+    Min = 0,
+    Max = 30,
+    Rounding = 0,
+    Callback = function(value)
+        aimbotPrediction = value / 100
+    end
+})
+
+CombatBox:AddSlider("AimbotFov", {
+    Text = "Aim FOV Radius",
+    Default = 220,
+    Min = 40,
+    Max = 700,
+    Rounding = 0,
+    Callback = function(value)
+        aimbotFovPixels = value
+    end
+})
+
+CombatBox:AddSlider("AimbotMaxDistance", {
+    Text = "Aim Max Distance",
+    Default = 250,
+    Min = 25,
+    Max = 1000,
+    Rounding = 0,
+    Callback = function(value)
+        aimbotMaxDistance = value
+    end
+})
+
+CombatBox:AddToggle("AimbotVisibleCheck", {
+    Text = "Aim Visible Check",
+    Default = true,
+    Callback = function(value)
+        aimbotVisibleCheck = value
+    end
+})
+
+local function removeESP(p)
+    if espObjects[p.Name] then
+        for _, obj in pairs(espObjects[p.Name]) do
+            pcall(function()
+                if typeof(obj) == "RBXScriptConnection" then
+                    obj:Disconnect()
+                else
+                    obj:Destroy()
+                end
+            end)
+        end
+
+        espObjects[p.Name] = nil
+    end
+end
+
+local function buildESP(p, char)
+    if not char or p == player then
+        return
+    end
+
+    if not isPlayerAlive(p) then
+        return
+    end
+
+    local isFriend = friendsList[p.Name]
+    local col = isFriend and espFriendColor or espColor
+    espObjects[p.Name] = {}
+
+    if espMode == "Highlight" then
+        local highlight = Instance.new("Highlight")
+        highlight.Name = "ESPHighlight"
+        highlight.Adornee = char
+        highlight.FillColor = col
+        highlight.OutlineColor = col
+        highlight.FillTransparency = espHighlightFillTransparency
+        highlight.OutlineTransparency = espHighlightOutlineTransparency
+        highlight.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+        highlight.Parent = Workspace
+        table.insert(espObjects[p.Name], highlight)
+
+        local hpConn = RunService.Heartbeat:Connect(function()
+            if not highlight or not highlight.Parent then
+                return
+            end
+
+            local hum = char:FindFirstChildOfClass("Humanoid")
+            if hum then
+                highlight.Enabled = not (espHpCheck and hum.Health <= 0.1)
+            end
+        end)
+
+        table.insert(espObjects[p.Name], hpConn)
+    elseif espMode == "3D" then
+        local box = Instance.new("SelectionBox")
+        box.Name = "ESP3D"
+        box.Color3 = col
+        box.LineThickness = esp3DLineThickness
+        box.SurfaceTransparency = 1
+        box.SurfaceColor3 = col
+        box.Adornee = char
+        box.Parent = Workspace
+        table.insert(espObjects[p.Name], box)
+
+        local hpConn = RunService.Heartbeat:Connect(function()
+            if not box or not box.Parent then
+                return
+            end
+
+            local hum = char:FindFirstChildOfClass("Humanoid")
+            if hum then
+                if espHpCheck and hum.Health <= 0.1 then
+                    box.Adornee = nil
+                else
+                    box.Adornee = char
+                end
+            end
+        end)
+
+        table.insert(espObjects[p.Name], hpConn)
+    elseif espMode == "2D" then
+        local hrpTarget = char:FindFirstChild("HumanoidRootPart")
+        if not hrpTarget then
+            hrpTarget = char:WaitForChild("HumanoidRootPart", 5)
+            if not hrpTarget then
+                return
+            end
+        end
+
+        local bb = Instance.new("BillboardGui")
+        bb.Name = "ESP2D"
+        bb.Size = UDim2.new(0, 50, 0, 80)
+        bb.AlwaysOnTop = true
+        bb.Adornee = hrpTarget
+        bb.Parent = hrpTarget
+
+        local frame = Instance.new("Frame")
+        frame.Size = UDim2.new(1, 0, 1, 0)
+        frame.BackgroundTransparency = 1
+        frame.BorderSizePixel = 0
+        frame.Parent = bb
+
+        local stroke = Instance.new("UIStroke")
+        stroke.Color = col
+        stroke.Thickness = 2
+        stroke.Parent = frame
+
+        local nameLabel = Instance.new("TextLabel")
+        nameLabel.Size = UDim2.new(1, 0, 0, 14)
+        nameLabel.Position = UDim2.new(0, 0, -0.22, 0)
+        nameLabel.BackgroundTransparency = 1
+        nameLabel.Text = p.Name
+        nameLabel.TextColor3 = col
+        nameLabel.TextSize = 10
+        nameLabel.Font = Enum.Font.GothamBold
+        nameLabel.Parent = bb
+
+        local hpBg = Instance.new("Frame")
+        hpBg.Size = UDim2.new(0, 4, 1, 0)
+        hpBg.Position = UDim2.new(0, -8, 0, 0)
+        hpBg.BackgroundColor3 = Color3.fromRGB(50, 50, 50)
+        hpBg.BorderSizePixel = 0
+        hpBg.Parent = bb
+
+        local hpFill = Instance.new("Frame")
+        hpFill.Size = UDim2.new(1, 0, 1, 0)
+        hpFill.AnchorPoint = Vector2.new(0, 1)
+        hpFill.Position = UDim2.new(0, 0, 1, 0)
+        hpFill.BackgroundColor3 = Color3.fromRGB(80, 200, 80)
+        hpFill.BorderSizePixel = 0
+        hpFill.Parent = hpBg
+
+        local hpConn = RunService.Heartbeat:Connect(function()
+            if not hpFill or not hpFill.Parent then
+                return
+            end
+
+            local hum = char:FindFirstChildOfClass("Humanoid")
+            if hum then
+                if espHpCheck and hum.Health <= 0.1 then
+                    bb.Enabled = false
+                    return
+                else
+                    bb.Enabled = true
+                end
+
+                local pct = math.clamp(hum.Health / math.max(hum.MaxHealth, 1), 0, 1)
+                hpFill.Size = UDim2.new(1, 0, pct, 0)
+
+                if pct > 0.6 then
+                    hpFill.BackgroundColor3 = Color3.fromRGB(80, 200, 80)
+                elseif pct > 0.3 then
+                    hpFill.BackgroundColor3 = Color3.fromRGB(220, 180, 40)
+                else
+                    hpFill.BackgroundColor3 = Color3.fromRGB(220, 60, 60)
+                end
+            end
+        end)
+
+        table.insert(espObjects[p.Name], bb)
+        table.insert(espObjects[p.Name], hpConn)
+    end
+end
+
+local function createESP(p)
+    if p == player then
+        return
+    end
+
+    if p.Character then
+        buildESP(p, p.Character)
+    end
+
+    p.CharacterRemoving:Connect(function()
+        removeESP(p)
+    end)
+
+    p.CharacterAdded:Connect(function(char)
+        removeESP(p)
+        task.wait(0.5)
+
+        if espEnabled then
+            buildESP(p, char)
+        end
+    end)
+end
+
+local function refreshESP()
+    for _, p in ipairs(Players:GetPlayers()) do
+        removeESP(p)
+        if espEnabled then
+            createESP(p)
+        end
+    end
+end
+
+VisualBox:AddLabel("ESP")
+VisualBox:AddToggle("ESPEnabled", {
+    Text = "ESP",
+    Default = false,
+    Callback = function(value)
+        espEnabled = value
+        refreshESP()
+
+        if value then
+            Players.PlayerAdded:Connect(function(p)
+                if espEnabled then
+                    task.wait(1)
+                    createESP(p)
+                end
+            end)
+
+            Players.PlayerRemoving:Connect(function(p)
+                removeESP(p)
+            end)
+        end
+    end
+})
+
+VisualBox:AddDropdown("ESPMode", {
+    Values = { "Highlight", "3D", "2D" },
+    Default = 1,
+    Multi = false,
+    Text = "ESP Mode",
+    Callback = function(value)
+        espMode = value
+        if espEnabled then
+            refreshESP()
+        end
+    end
+})
+
+VisualBox:AddSlider("ESPHighlightFillTransparency", {
+    Text = "Highlight Fill x100",
+    Default = 75,
+    Min = 0,
+    Max = 100,
+    Rounding = 0,
+    Callback = function(value)
+        espHighlightFillTransparency = value / 100
+
+        if espEnabled then
+            refreshESP()
+        end
+    end
+})
+
+VisualBox:AddSlider("ESPHighlightOutlineTransparency", {
+    Text = "Highlight Outline x100",
+    Default = 0,
+    Min = 0,
+    Max = 100,
+    Rounding = 0,
+    Callback = function(value)
+        espHighlightOutlineTransparency = value / 100
+
+        if espEnabled then
+            refreshESP()
+        end
+    end
+})
+
+VisualBox:AddLabel("ESP Color"):AddColorPicker("ESPColorPicker", {
+    Default = espColor,
+    Title = "ESP Color",
+    Transparency = 0,
+    Callback = function(value)
+        espColor = value
+
+        if espEnabled then
+            refreshESP()
+        end
+    end
+})
+
+VisualBox:AddLabel("Friend ESP Color"):AddColorPicker("ESPFriendColorPicker", {
+    Default = espFriendColor,
+    Title = "Friend ESP Color",
+    Transparency = 0,
+    Callback = function(value)
+        espFriendColor = value
+
+        if espEnabled then
+            refreshESP()
+        end
+
+        if nametags and refreshNametags then
+            refreshNametags()
+        end
+    end
+})
+
+VisualBox:AddSlider("ESP3DLineThickness", {
+    Text = "3D Line Thickness",
+    Default = 12,
+    Min = 5,
+    Max = 30,
+    Rounding = 0,
+    Callback = function(value)
+        esp3DLineThickness = value / 1000
+
+        if espEnabled then
+            refreshESP()
+        end
+    end
+})
+
+VisualBox:AddToggle("ESPHpCheck", {
+    Text = "Hide ESP on dead (HP <= 0.1)",
+    Default = true,
+    Callback = function(value)
+        espHpCheck = value
+
+        if espEnabled then
+            refreshESP()
+        end
+
+        if nametags and refreshNametags then
+            refreshNametags()
+        end
+    end
+})
+
+local function removeNametag(p)
+    local key = p.Name .. "_ntconn"
+
+    if nametagObjects[key] then
+        pcall(function()
+            nametagObjects[key]:Disconnect()
+        end)
+        nametagObjects[key] = nil
+    end
+
+    if nametagObjects[p.Name] then
+        pcall(function()
+            nametagObjects[p.Name]:Destroy()
+        end)
+        nametagObjects[p.Name] = nil
+    end
+end
+
+local function createNametag(p)
+    if p == player then
+        return
+    end
+
+    removeNametag(p)
+
+    local function buildTag(char)
+        if not char then
+            return
+        end
+
+        local head = char:FindFirstChild("Head")
+        if not head then
+            return
+        end
+
+        if not isPlayerAlive(p) then
+            return
+        end
+
+        local bb = Instance.new("BillboardGui")
+        bb.Size = UDim2.new(0, 100, 0, 20)
+        bb.StudsOffset = Vector3.new(0, 2.5, 0)
+        bb.AlwaysOnTop = true
+        bb.Adornee = head
+        bb.Parent = head
+
+        local lbl = Instance.new("TextLabel")
+        lbl.Size = UDim2.new(1, 0, 1, 0)
+        lbl.BackgroundTransparency = 1
+        lbl.Text = p.Name
+        lbl.TextColor3 = friendsList[p.Name] and espFriendColor or Color3.fromRGB(255, 255, 255)
+        lbl.TextSize = 6
+        lbl.Font = Enum.Font.GothamBold
+        lbl.Parent = bb
+
+        nametagObjects[p.Name] = bb
+
+        local conn = RunService.Heartbeat:Connect(function()
+            if not bb or not bb.Parent then
+                return
+            end
+
+            local hum = char:FindFirstChildOfClass("Humanoid")
+            if hum then
+                bb.Enabled = not (espHpCheck and hum.Health <= 0.1)
+            end
+        end)
+
+        nametagObjects[p.Name .. "_ntconn"] = conn
+    end
+
+    if p.Character then
+        buildTag(p.Character)
+    end
+
+    p.CharacterRemoving:Connect(function()
+        removeNametag(p)
+    end)
+
+    p.CharacterAdded:Connect(function(char)
+        task.wait(0.5)
+        if nametags then
+            buildTag(char)
+        end
+    end)
+end
+
+refreshNametags = function()
+    for _, p in ipairs(Players:GetPlayers()) do
+        if nametags then
+            createNametag(p)
+        else
+            removeNametag(p)
+        end
+    end
+end
+
+VisualBox:AddToggle("NametagsEnabled", {
+    Text = "Nametags",
+    Default = false,
+    Callback = function(value)
+        nametags = value
+        refreshNametags()
+    end
+})
+
+local function isAirborne(hum)
+    if not hum then
+        return false
+    end
+
+    local state = hum:GetState()
+    return hum.FloorMaterial == Enum.Material.Air and (
+        state == Enum.HumanoidStateType.Freefall
+        or state == Enum.HumanoidStateType.Jumping
+        or state == Enum.HumanoidStateType.FallingDown
+    )
+end
+
+local function stopNofall()
+    nofallEnabled = false
+
+    if nofallConn then
+        nofallConn:Disconnect()
+        nofallConn = nil
+    end
+end
+
+local function startNofall()
+    stopNofall()
+    nofallEnabled = true
+
+    nofallConn = RunService.Stepped:Connect(function(_, deltaTime)
+        if not nofallEnabled or not character or not humanoid or not hrp then
+            return
+        end
+
+        if not isAirborne(humanoid) then
+            return
+        end
+
+        local velocity = hrp.AssemblyLinearVelocity
+        if velocity.Y < -0.5 then
+            local targetY = -glideFallSpeed
+            if velocity.Y < targetY then
+                local alpha = math.clamp(deltaTime * 10, 0.08, 0.35)
+                local newY = velocity.Y + (targetY - velocity.Y) * alpha
+
+                hrp.AssemblyLinearVelocity = Vector3.new(
+                    velocity.X,
+                    newY,
+                    velocity.Z
+                )
+            end
+        end
+    end)
+end
+
+MovementBox:AddLabel("No Fall + Glide")
+MovementBox:AddToggle("NofallEnabled", {
+    Text = "NoFall + Glide",
+    Default = false,
+    Callback = function(value)
+        activeBinds["NoFall"] = { active = value, key = "Auto" }
+        updateKeybindsList()
+
+        if value then
+            startNofall()
+        else
+            stopNofall()
+        end
+    end
+}):AddKeyPicker("NofallBind", {
+    Default = "None",
+    Text = "NoFall Bind",
+    Mode = "Toggle",
+    Callback = function(value)
+        if value then
+            Toggles.NofallEnabled:SetValue(not Toggles.NofallEnabled.Value)
+        end
+    end
+})
+
+MovementBox:AddSlider("GlideFallSpeed", {
+    Text = "Glide Fall Speed",
+    Default = 14,
+    Min = 4,
+    Max = 40,
+    Rounding = 0,
+    Callback = function(value)
+        glideFallSpeed = value
+    end
+})
+
+local function stopSwim()
+    swimEnabled = false
+
+    if swimConn then
+        swimConn:Disconnect()
+        swimConn = nil
+    end
+
+    if originalSwimGravity ~= nil then
+        Workspace.Gravity = originalSwimGravity
+        originalSwimGravity = nil
+    end
+
+    if humanoid then
+        humanoid:SetStateEnabled(Enum.HumanoidStateType.GettingUp, true)
+        humanoid:SetStateEnabled(Enum.HumanoidStateType.Running, true)
+        humanoid:SetStateEnabled(Enum.HumanoidStateType.RunningNoPhysics, true)
+        humanoid:SetStateEnabled(Enum.HumanoidStateType.Freefall, true)
+        humanoid:SetStateEnabled(Enum.HumanoidStateType.FallingDown, true)
+        humanoid:ChangeState(Enum.HumanoidStateType.RunningNoPhysics)
+
+        if originalSwimWalkSpeed ~= nil then
+            humanoid.WalkSpeed = originalSwimWalkSpeed
+            originalSwimWalkSpeed = nil
+        else
+            humanoid.WalkSpeed = 16
+        end
+    end
+
+    if hrp then
+        hrp.AssemblyLinearVelocity = Vector3.zero
+    end
+end
+
+startSwim = function()
+    stopSwim()
+    swimEnabled = true
+
+    if not humanoid or not hrp then
+        return
+    end
+
+    originalSwimGravity = Workspace.Gravity
+    originalSwimWalkSpeed = humanoid.WalkSpeed
+    Workspace.Gravity = 0
+
+    humanoid:SetStateEnabled(Enum.HumanoidStateType.GettingUp, false)
+    humanoid:SetStateEnabled(Enum.HumanoidStateType.Running, false)
+    humanoid:SetStateEnabled(Enum.HumanoidStateType.RunningNoPhysics, false)
+    humanoid:SetStateEnabled(Enum.HumanoidStateType.Freefall, false)
+    humanoid:SetStateEnabled(Enum.HumanoidStateType.FallingDown, false)
+    humanoid:ChangeState(Enum.HumanoidStateType.Swimming)
+
+    swimConn = RunService.RenderStepped:Connect(function()
+        if not swimEnabled or not character or not humanoid or not hrp then
+            return
+        end
+
+        humanoid.WalkSpeed = swimSpeed
+
+        if humanoid:GetState() ~= Enum.HumanoidStateType.Swimming then
+            humanoid:ChangeState(Enum.HumanoidStateType.Swimming)
+        end
+
+        local velocity = Vector3.zero
+        local moveDirection = humanoid.MoveDirection
+
+        if moveDirection.Magnitude > 0 then
+            velocity += moveDirection.Unit * swimSpeed
+        end
+
+        if UserInputService:IsKeyDown(Enum.KeyCode.Space) then
+            velocity += Vector3.new(0, swimSpeed, 0)
+        end
+
+        if UserInputService:IsKeyDown(Enum.KeyCode.LeftControl) then
+            velocity += Vector3.new(0, -swimSpeed, 0)
+        end
+
+        hrp.AssemblyLinearVelocity = velocity
+    end)
+end
+
+MovementBox:AddLabel("Swim")
+MovementBox:AddToggle("SwimEnabled", {
+    Text = "Swim",
+    Default = false,
+    Callback = function(value)
+        activeBinds["Swim"] = { active = value, key = "Bind" }
+        updateKeybindsList()
+
+        if value then
+            startSwim()
+        else
+            stopSwim()
+        end
+    end
+}):AddKeyPicker("SwimBind", {
+    Default = "None",
+    Text = "Swim Bind",
+    Mode = "Toggle",
+    Callback = function(value)
+        if value then
+            Toggles.SwimEnabled:SetValue(not Toggles.SwimEnabled.Value)
+        end
+    end
+})
+
+MovementBox:AddSlider("SwimSpeed", {
+    Text = "Swim Speed",
+    Default = 16,
+    Min = 4,
+    Max = 80,
+    Rounding = 0,
+    Callback = function(value)
+        swimSpeed = value
+    end
+})
+
+local function stopSpeed()
+    speedEnabled = false
+
+    if speedConn then
+        speedConn:Disconnect()
+        speedConn = nil
+    end
+
+    if character then
+        local hum = character:FindFirstChildOfClass("Humanoid")
+        if hum then
+            hum.WalkSpeed = 16
+        end
+    end
+end
+
+local function startSpeed()
+    stopSpeed()
+    speedEnabled = true
+
+    if speedMode == "Strafe" then
+        speedConn = RunService.Heartbeat:Connect(function()
+            if not speedEnabled or not character then
+                return
+            end
+
+            local hum = character:FindFirstChildOfClass("Humanoid")
+            if not hum then
+                return
+            end
+
+            if hum.MoveDirection.Magnitude > 0 then
+                hum.WalkSpeed = 16 * speedValue
+            else
+                hum.WalkSpeed = 16
+            end
+        end)
+    elseif speedMode == "TpWalk" then
+        speedConn = RunService.Heartbeat:Connect(function()
+            if not speedEnabled or not character or not hrp then
+                return
+            end
+
+            local hum = character:FindFirstChildOfClass("Humanoid")
+            if not hum then
+                return
+            end
+
+            local moveDir = hum.MoveDirection
+            if moveDir.Magnitude > 0 then
+                hrp.CFrame = hrp.CFrame + moveDir * speedValue
+            end
+        end)
+    end
+end
+
+MovementBox:AddLabel("Speedhack")
+MovementBox:AddToggle("SpeedEnabled", {
+    Text = "Speedhack",
+    Default = false,
+    Callback = function(value)
+        speedEnabled = value
+        activeBinds["Speed"] = { active = value, key = "Auto" }
+        updateKeybindsList()
+
+        if value then
+            startSpeed()
+        else
+            stopSpeed()
+        end
+    end
+}):AddKeyPicker("SpeedBind", {
+    Default = "None",
+    Text = "Speed Bind",
+    Mode = "Toggle",
+    Callback = function(value)
+        if value then
+            Toggles.SpeedEnabled:SetValue(not Toggles.SpeedEnabled.Value)
+        end
+    end
+})
+
+MovementBox:AddDropdown("SpeedMode", {
+    Values = { "Strafe", "TpWalk" },
+    Default = 1,
+    Multi = false,
+    Text = "Speed Mode",
+    Callback = function(value)
+        speedMode = value
+        if speedEnabled then
+            startSpeed()
+        end
+    end
+})
+
+MovementBox:AddSlider("SpeedMultiplier", {
+    Text = "Speed Multiplier",
+    Default = 1,
+    Min = 1,
+    Max = 3,
+    Rounding = 1,
+    Callback = function(value)
+        speedValue = value
+        if speedEnabled then
+            startSpeed()
+        end
+    end
+})
+
+local friendsListLabel = FriendsBox:AddLabel("Friends List: (empty)")
+
+local function refreshFriendsLabel()
+    local names = {}
+    for name in pairs(friendsList) do
+        table.insert(names, name)
+    end
+
+    if #names == 0 then
+        friendsListLabel:SetText("Friends List: (empty)")
+    else
+        friendsListLabel:SetText("Friends: " .. table.concat(names, ", "))
+    end
+
+    refreshESP()
+    refreshNametags()
+end
+
+local addFriendInput = ""
+FriendsBox:AddInput("AddFriendInput", {
+    Default = "",
+    Numeric = false,
+    Text = "Player Name",
+    Placeholder = "Enter name...",
+    Callback = function(value)
+        addFriendInput = value
+    end
+})
+
+FriendsBox:AddButton({
+    Text = "Add Friend",
+    Func = function()
+        if addFriendInput and addFriendInput ~= "" then
+            friendsList[addFriendInput] = true
+            Library:Notify("Added friend: " .. addFriendInput, 2)
+            refreshFriendsLabel()
+        end
+    end,
+    DoubleClick = false
+})
+
+FriendsBox:AddButton({
+    Text = "Remove Friend",
+    Func = function()
+        if addFriendInput and friendsList[addFriendInput] then
+            friendsList[addFriendInput] = nil
+            Library:Notify("Removed friend: " .. addFriendInput, 2)
+            refreshFriendsLabel()
+        end
+    end,
+    DoubleClick = false
+})
+
+FriendsBox:AddButton({
+    Text = "Clear All Friends",
+    Func = function()
+        friendsList = {}
+        Library:Notify("Cleared friends list", 2)
+        refreshFriendsLabel()
+    end,
+    DoubleClick = true
+})
+
+local function captureLightingDefaults()
+    if originalAmbient == nil then
+        originalAmbient = Lighting.Ambient
+        originalOutdoorAmbient = Lighting.OutdoorAmbient
+        originalBrightness = Lighting.Brightness
+        originalClockTime = Lighting.ClockTime
+        originalGlobalShadows = Lighting.GlobalShadows
+    end
+end
+
+local function applyLoopFullbright()
+    captureLightingDefaults()
+    Lighting.Ambient = Color3.fromRGB(255, 255, 255)
+    Lighting.OutdoorAmbient = Color3.fromRGB(255, 255, 255)
+    Lighting.Brightness = 3
+    Lighting.ClockTime = 14
+    Lighting.GlobalShadows = false
+end
+
+local function restoreLoopFullbright()
+    if originalAmbient ~= nil then
+        Lighting.Ambient = originalAmbient
+        Lighting.OutdoorAmbient = originalOutdoorAmbient
+        Lighting.Brightness = originalBrightness
+        Lighting.ClockTime = originalClockTime
+        Lighting.GlobalShadows = originalGlobalShadows
+    end
+end
+
+MiscBox:AddLabel("Loop Fake Block")
+MiscBox:AddToggle("LoopFBEnabled", {
+    Text = "Loop FB",
+    Default = false,
+    Callback = function(value)
+        loopfbEnabled = value
+        activeBinds["LoopFB"] = { active = value, key = "Auto" }
+        updateKeybindsList()
+
+        if value then
+            if loopfbConn then
+                loopfbConn:Disconnect()
+                loopfbConn = nil
+            end
+
+            applyLoopFullbright()
+
+            loopfbConn = RunService.Heartbeat:Connect(function()
+                if not loopfbEnabled then
+                    return
+                end
+
+                applyLoopFullbright()
+            end)
+        else
+            if loopfbConn then
+                loopfbConn:Disconnect()
+                loopfbConn = nil
+            end
+
+            restoreLoopFullbright()
+        end
+    end
+}):AddKeyPicker("LoopFBBind", {
+    Default = "None",
+    Text = "Loop FB Bind",
+    Mode = "Toggle",
+    Callback = function(value)
+        if value then
+            Toggles.LoopFBEnabled:SetValue(not Toggles.LoopFBEnabled.Value)
+        end
+    end
+})
+
+MiscBox:AddLabel("No Fog")
+MiscBox:AddToggle("NoFogEnabled", {
+    Text = "No Fog",
+    Default = false,
+    Callback = function(value)
+        nofogEnabled = value
+
+        if value then
+            originalFogStart = Lighting.FogStart
+            originalFogEnd = Lighting.FogEnd
+            Lighting.FogStart = 100000
+            Lighting.FogEnd = 100000
+        else
+            Lighting.FogStart = originalFogStart or 0
+            Lighting.FogEnd = originalFogEnd or 100000
+        end
+    end
+})
+
+WIPBox:AddLabel("Experimental")
+WIPBox:AddToggle("AntiSlowEnabled", {
+    Text = "Anti-slow",
+    Default = false,
+    Callback = function(value)
+        antiSlowEnabled = value
+        activeBinds["AntiSlow"] = { active = value, key = "WIP" }
+        updateKeybindsList()
+
+        if character then
+            character:SetAttribute("AntiSlowUI", value)
+        end
+
+        if Library and Library.Notify then
+            if value then
+                Library:Notify("Anti-slow placeholder enabled. Hook it to your own server-side item-use speed logic.", 4)
+            else
+                Library:Notify("Anti-slow placeholder disabled.", 2)
+            end
+        end
+    end
+})
+
+WIPBox:AddToggle("AntiRagdollEnabled", {
+    Text = "Anti-ragdoll",
+    Default = false,
+    Callback = function(value)
+        antiRagdollEnabled = value
+        activeBinds["AntiRagdoll"] = { active = value, key = "WIP" }
+        updateKeybindsList()
+
+        if character then
+            character:SetAttribute("AntiRagdollUI", value)
+        end
+
+        if Library and Library.Notify then
+            if value then
+                Library:Notify("Anti-ragdoll placeholder enabled. Hook it to your own server-side ragdoll rules.", 4)
+            else
+                Library:Notify("Anti-ragdoll placeholder disabled.", 2)
+            end
+        end
+    end
+})
+
+WIPBox:AddToggle("AssistHitEnabled", {
+    Text = "Assist Hit",
+    Default = false,
+    Callback = function(value)
+        assistHitEnabled = value
+        activeBinds["AssistHit"] = { active = value, key = "Bind" }
+        updateKeybindsList()
+
+        if value then
+            assistHitStatus = "Ready"
+            startAssistHit()
+        else
+            assistHitStatus = "Idle"
+            assistHitTargetName = "none"
+            stopAssistHit()
+        end
+    end
+}):AddKeyPicker("AssistHitBind", {
+    Default = "H",
+    Text = "Assist Hit Bind",
+    Mode = "Toggle",
+    Callback = function(value)
+        if value then
+            Toggles.AssistHitEnabled:SetValue(not Toggles.AssistHitEnabled.Value)
+        end
+    end
+})
+
+WIPBox:AddToggle("AssistHitTeamCheck", {
+    Text = "Assist Team Check",
+    Default = true,
+    Callback = function(value)
+        assistHitTeamCheck = value
+    end
+})
+
+WIPBox:AddSlider("AssistHitDistance", {
+    Text = "Assist Distance",
+    Default = 18,
+    Min = 6,
+    Max = 40,
+    Rounding = 0,
+    Callback = function(value)
+        assistHitMaxDistance = value
+    end
+})
+
+WIPBox:AddSlider("AssistHitFov", {
+    Text = "Assist FOV Radius",
+    Default = 180,
+    Min = 40,
+    Max = 400,
+    Rounding = 0,
+    Callback = function(value)
+        assistHitMaxFovPixels = value
+    end
+})
+
+WIPBox:AddSlider("AssistHitLockTime", {
+    Text = "Assist Lock Time x10",
+    Default = 12,
+    Min = 1,
+    Max = 30,
+    Rounding = 0,
+    Callback = function(value)
+        assistHitLockTime = value / 10
+    end
+})
+
+WIPBox:AddSlider("AssistHitLockDistance", {
+    Text = "Assist Lock Distance",
+    Default = 12,
+    Min = 4,
+    Max = 25,
+    Rounding = 0,
+    Callback = function(value)
+        assistHitLockDistance = value
+    end
+})
+
+assistHitTargetLabel = WIPBox:AddLabel("Assist Target: none")
+assistHitStateLabel = WIPBox:AddLabel("Assist State: Idle")
+WIPBox:AddLabel("Assist Hit uses GameRemotes.TryAttackTarget")
+WIPBox:AddLabel("Recent successful hit can keep a short nearby target lock")
+
+assistHitUiConn = RunService.RenderStepped:Connect(function()
+    if assistHitEnabled then
+        local target = getClosestAssistHitTarget()
+        assistHitTargetName = target and target.Name or "none"
+    else
+        assistHitTargetName = "none"
+    end
+
+    getAssistHitRemotes()
+
+    if assistHitTargetLabel then
+        assistHitTargetLabel:SetText("Assist Target: " .. assistHitTargetName)
+    end
+
+    if assistHitStateLabel then
+        assistHitStateLabel:SetText("Assist State: " .. assistHitStatus)
+    end
+end)
+
+if ThemeManager then
+    ThemeManager:SetLibrary(Library)
+    ThemeManager:SetFolder("4ifurConfig")
+end
+
+if SaveManager then
+    SaveManager:SetLibrary(Library)
+    SaveManager:IgnoreThemeSettings()
+    SaveManager:SetIgnoreIndexes({ "MenuKeybind" })
+    SaveManager:SetFolder("4ifurConfig")
+    SaveManager:BuildConfigSection(Tabs.Config)
+end
+
+if ThemeManager then
+    ThemeManager:ApplyToTab(Tabs.Config)
+end
+
+local MenuGroup = Tabs.Config:AddLeftGroupbox("Menu")
+MenuGroup:AddLabel("Menu bind"):AddKeyPicker("MenuKeybind", {
+    Default = "Delete",
+    NoUI = true,
+    Text = "Menu keybind"
+})
+
+MenuGroup:AddButton({
+    Text = "Unload Cheat",
+    Func = function()
+        Library:Unload()
+    end,
+    DoubleClick = true
+})
+
+Library.ToggleKeybind = Options.MenuKeybind
+
+task.spawn(function()
+    while task.wait(1) do
+        Library:SetWatermark(string.format("4ifur.su | %s", os.date("%H:%M:%S")))
+    end
+end)
+
+Library:SetWatermarkVisibility(true)
+
+pcall(function()
+    Library:Notify("Aim Assist v2 loaded in Combat tab", 4)
+end)
+
+Library:OnUnload(function()
+    stopAimbot()
+    stopKillAura()
+    stopNofall()
+    stopSwim()
+    stopSpeed()
+    stopAssistHit()
+    disconnectAssistHitFeedback()
+
+    if loopfbConn then
+        loopfbConn:Disconnect()
+        loopfbConn = nil
+    end
+
+    if assistHitUiConn then
+        assistHitUiConn:Disconnect()
+        assistHitUiConn = nil
+    end
+
+    restoreLoopFullbright()
+
+    if nofogEnabled then
+        Lighting.FogStart = originalFogStart or 0
+        Lighting.FogEnd = originalFogEnd or 100000
+    end
+
+    if keybindsListGui then
+        keybindsListGui:Destroy()
+    end
+
+    if targetHudGui then
+        targetHudGui:Destroy()
+    end
+
+    if infoGui then
+        infoGui:Destroy()
+    end
+
+    for _, p in ipairs(Players:GetPlayers()) do
+        removeESP(p)
+        removeNametag(p)
+    end
+
+    print("4ifur.su unloaded")
+end)
+
+print("4ifur.su loaded, press Del to open")
